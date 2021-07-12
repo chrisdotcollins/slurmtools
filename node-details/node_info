@@ -1,0 +1,116 @@
+#!/bin/bash
+
+## Globals
+TARGET_BIOS=01.01.1029
+#TARGET_BMC=1.61.12390
+#TARGET_SDR=1.17
+#TARGET_ME=03.01.03.072
+
+## Start
+
+[[ -z "${1}" ]] && { echo "Please pass the node number as argument 1, i.e. ${0} c100" ; exit 0 ; }
+[[ ${1} == node* ]] && { NODE_IS=$1 ; CONTAINER_IS=$( echo ${NODE_IS} | sed 's/node/c/g' ) ;}
+[[ ${1} == c* ]] && { CONTAINER_IS=$1 ; NODE_IS=$( echo ${CONTAINER_IS} | sed 's/c/node/g' ) ;}
+
+## Controller based information
+
+CONTROLLER_OUT=$( sudo ssh controller-2 -C "/root/node_info_script.sh ${CONTAINER_IS}" )
+CHASSIS_LED=$( echo "${CONTROLLER_OUT}" | awk -F":" ' $1 ~ /A/ { print $2 }' )
+POWER_STATE=$( echo "${CONTROLLER_OUT}" | awk -F":| " ' $1 ~ /B/ { print $NF }' )
+SEL_OUTPUTS=$( echo "${CONTROLLER_OUT}" | awk ' $1 ~/[0-9].*/ { print $0 }' | tail -20 )
+
+## Node based information
+
+#NODE_UP=$( sudo ssh -o ConnectTimeout=1 node100 uptime 2> /dev/null |  awk -F":" '{ print $NF }' | sed 's/,//g;s/^ //g' )
+NODE_UP=$( sudo ssh -o ConnectTimeout=1 ${NODE_IS} "uptime -s ; uptime" 2> /dev/null )
+NODE_TIME=$( echo "${NODE_UP}" |  awk -F":" ' FNR == 1 { print $0 }' )
+NODE_LOAD=$( echo "${NODE_UP}" |  awk -F":" ' FNR == 2 { print $NF }' | sed 's/,//g;s/^ //g' )
+CONT_UP=$( sudo ssh -o ConnectTimeout=1 ${CONTAINER_IS} "uptime -s" 2> /dev/null )
+
+[[ -z "${NODE_UP}" ]] && NODE_UPSTATE="Down" || NODE_UPSTATE="Up"
+[[ -z "${CONT_UP}" ]] && CONT_UPSTATE="Down" || CONT_UPSTATE="Up"
+
+## BIOS information
+# Going to assume that if the BIOS is up to date, then the BMC, ME and SDR are also up to date (they should be!)
+#BMC1=$( sudo ssh -o ConnectTimeout=1 ${NODE_IS} -C ipmitool mc info | grep "Firmware Revision" | awk '{ print $NF }' )
+#BMC2=$( sudo ssh -o ConnectTimeout=1 ${NODE_IS} -C dmidecode | grep -A1 SE5C610 | tail -1 | awk -F"." '{ print $NF }' )
+#ME=$( sudo ssh -o ConnectTimeout=1 ${NODE_IS} -C dmidecode | grep 3.1.3 | tr -d [:space:] | awk -F"." '{ print "0"$1".0"$2".0"$3".0"$4 }' )
+#SDR=$( sudo ssh -o ConnectTimeout=1 ${NODE_IS} -C dmidecode | grep "SDR Package" | awk '{ print $NF }' )
+BIOS=$( sudo ssh -o ConnectTimeout=1 ${NODE_IS} -C dmidecode -s bios-version | awk -F"." '{ print $3"."$4"."$5 }' )
+[[ ${BIOS} == ${TARGET_BIOS} ]] && BIOS_PRINT="${BIOS} (ok)" || BIOS_PRINT="${BIOS} (update avail)" ;
+#[[ ${BMC1}.${BMC2} == ${TARGET_BMC} ]] && BMC_PRINT="${BMC1}.${BMC2} (ok)" || BMC_PRINT="${BMC} (update avail)" ;
+#[[ ${ME} == ${TARGET_ME} ]] && ME_PRINT="${ME} (ok)" || ME_PRINT="${ME} (update avail)" ;
+#[[ ${SDR} == ${TARGET_SDR} ]] && SDR_PRINT="${SDR} (ok)" || SDR_PRINT="${SDR} (update avail)" ;
+#echo ${BMC_PRINT}
+#echo ${ME_PRINT}
+#echo ${SDR_PRINT}
+
+## Rack based information
+
+RACK_INFO=$( echo ${CONTAINER_IS} | awk 'function ceil(x, y){ y=int(x); return(x>y?y+1:y) }  { if (substr($1,1,1)~/c/ && substr($1,2,3) < 184 ) { CHASSIS=ceil(substr($1,2,3)/4) ; \
+                                    printf "Chassis,%i\n Chassis Group,c%03d-c%03d\n", CHASSIS, (CHASSIS*4)-3, CHASSIS*4 } else { print "Chassis ,"$0 } }' )
+#awk 'function ceil(x, y){y=int(x); return(x>y?y+1:y)}  { CHASSIS=ceil(substr($1,2,3)/4) ; printf "Chassis,%i\n Chassis Group,c%03d-c%03d\n", CHASSIS, (CHASSIS*4)-3, CHASSIS*4 }' )
+RACK_POST=$( grep ${NODE_IS} `dirname $0`/_rack.db | awk -F"," '{ print $4 }' )
+OPA_SWITCH=$( grep ${NODE_IS} `dirname $0`/_rack.db | awk -F"," '{ print $9 }' )
+
+## Slurm node information
+
+NODE_SINFO=$( sinfo -hn ${CONTAINER_IS} -o"%T|%O|%m|%e|%H|%E" )
+SLURM_STATE=$( echo ${NODE_SINFO} | awk -F"|" '{ print $1 }' )
+SLURM_LOAD=$( echo ${NODE_SINFO} | awk -F"|" '{ print $2 }' )
+SLURM_MEM=$( echo ${NODE_SINFO} | awk -F"|" '{ print int($4/(1024))"GB ("int(($4/$3)*100)"%)" }' )
+SLURM_UNDATE=$( echo ${NODE_SINFO} | awk -F"|" '{ print $5 }' )
+SLURM_UNREAS=$( echo ${NODE_SINFO} | awk -F"|" '{ print $6 }' )
+
+## Slurm job information
+NODE_SQUEUE=$( squeue -w ${CONTAINER_IS} -o "%u %i %j %o %L %e %C %D %N" )
+SQUEUE_OUTPUT=$( echo "${NODE_SQUEUE}" | awk '{ if ($4 ~/(null)/) { print $0 } else { get_command = "basename "$4 ; get_command | getline COMMAND ; $4=COMMAND ; print $0 }}' )
+
+## OOM Checks
+OOM_NODE=$( grep "kernel: Killed process" /trinity/tmp/vlm24hours.log | awk -v NODE_IS=${NODE_IS} ' $4 ~ NODE_IS { print $1,$2,$3,$4,$6,$8,$9 }' )
+
+## Output
+
+echo "General Information:"
+echo -e "\
+ Host,${NODE_IS} / ${CONTAINER_IS}\n\
+ Node Power ,${POWER_STATE^}\n\
+ Node LED ,${CHASSIS_LED}\n\
+ Node is ,${NODE_UPSTATE}\n\
+ Container is ,${CONT_UPSTATE}\n\
+ Boot time ,${NODE_TIME}\n\
+ Rack locations ,${RACK_POST}\n\
+ ${RACK_INFO}\n\
+ OPA switch ,${OPA_SWITCH}\n\
+ BIOS version ,${BIOS_PRINT}\n\
+ Load Avg ,${NODE_LOAD}"\
+ | column -s"," -t -o": "
+
+[[ ! -z "${SEL_OUTPUTS}" ]] && { echo ; echo "Recent SEL Events:" ; echo "${SEL_OUTPUTS}" | awk '{ $1=$2="" ; print " "$0 }' ; } || echo -e "\nNo recent SEL events"
+
+[[ ! -z "${OOM_NODE}" ]] && { echo ; echo "Recent OOM Events:" ; echo " ${OOM_NODE}"; }
+
+echo
+
+echo "Slurm Node Information:"
+if [[ ${SLURM_UNDATE} == "Unknown" ]]; then 
+ echo -e "\
+ Slurm state,${SLURM_STATE}\n\
+ Slurm load ,${SLURM_LOAD}\n\
+ Slurm memory available ,${SLURM_MEM}"\
+  | column -s"," -t -o": "
+else
+ echo -e "\
+ Slurm state,${SLURM_STATE}\n\
+ Slurm load ,${SLURM_LOAD}\n\
+ Slurm memory available ,${SLURM_MEM}\n\
+ Slurm reason ,${SLURM_UNREAS}\n\
+ Slurm timestamp ,${SLURM_UNDATE}"\
+  | column -s"," -t -o": "
+fi
+
+echo
+[[ $( wc -l <( echo "$NODE_SQUEUE" ) | awk '{ print $1 }' ) > 1 ]] && { echo -e "\nSlurm Job Information:" ; echo "${SQUEUE_OUTPUT}" | awk '{ print " "$0 }' | column -t; } || echo "No current jobs"
+
+echo 
+
